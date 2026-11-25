@@ -1,0 +1,616 @@
+#!/bin/sh
+# trizy: one operating framework for every coding agent and person in a repository.
+# POSIX sh + git only. `trizy` (install.sh) runs it; each project keeps its own copy at .trizy/bin/trizy.
+#
+#   trizy init [--track|--ignore] [--hooks=replace|merge]   install into this repository
+#   trizy update [--from SRC] [--ref R]  update this repository to the installed version (or SRC / a ref)
+#   trizy upgrade [--version vX.Y.Z]     install the latest release (or that one) as the user install
+#   trizy check | version
+#   trizy log task=".." result=pass|fail|partial [key=value ...]   append to the run journal
+#   trizy flow list|show F|add F [desc]|rm F|run F                 flows of steps
+#   trizy step add F NAME run|ask BODY | rm F NAME                  steps of a flow
+#   trizy gate commit | push [REMOTE_SHA]                           what the git hooks run
+#   trizy review prepare|verify [TREE]                              review receipt for the staged tree
+#   trizy worktree new BRANCH [BASE] | rm BRANCH [--force] | sweep | list
+#   trizy heavy -- CMD...                                           machine-wide queue for heavy commands
+set -eu
+
+KIT=.trizy
+BEGIN_MARK='<!-- trizy:begin'
+END_MARK='<!-- trizy:end -->'
+TAB=$(printf '\t')
+BUILTIN_FLOWS='commit push deliver:plan deliver:build deliver:gate deliver:verify'
+
+say() { printf 'trizy: %s\n' "$*"; }
+die() { printf 'trizy: %s\n' "$*" >&2; exit 1; }
+sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
+stamp() { date -u '+%Y%m%dT%H%M%SZ'; }
+to_root() { R=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git repository"; cd "$R"; }
+# The run journal lives in the common git dir: one per clone, shared by every worktree, never committed.
+journal_dir() { d=$(git rev-parse --git-common-dir) && case $d in /*) ;; *) d="$PWD/$d" ;; esac && printf "%s/trizy/runs\n" "$d"; }
+
+# The kit source this script belongs to, when it runs from a kit checkout (template/.trizy/bin/trizy).
+self_src() {
+  d=$(cd "$(dirname "$0")/../../.." 2>/dev/null && pwd) || return 1
+  [ -d "$d/template/$KIT" ] && [ -d "$d/project" ] && printf '%s\n' "$d"
+}
+
+load_conf() {
+  MAIN_BRANCH='' WORKTREE_ROOT='' HEAVY_SLOTS=1 REVIEW_REQUIRED=1 REVIEW_EXEMPT_BRANCHES='deliver/*--*' TRIZY_GIT=track TRIZY_SOURCE='' TRIZY_REF=main
+  # shellcheck disable=SC1090
+  [ -f "$KIT/project.conf" ] && . "./$KIT/project.conf"
+  MAIN_BRANCH=${MAIN_BRANCH:-$(main_branch)}
+  return 0
+}
+
+# The main branch, from git every time (never stored): the remote's default as last seen (origin/HEAD), else main.
+# init and update refresh origin/HEAD, so a default branch renamed on the server is picked up there.
+main_branch() {
+  b=$(git symbolic-ref --short -q refs/remotes/origin/HEAD 2>/dev/null || true)
+  printf '%s\n' "${b#origin/}" | sed 's/^$/main/'
+}
+refresh_main() { git remote get-url origin >/dev/null 2>&1 && git remote set-head origin --auto >/dev/null 2>&1 || true; }
+
+# ---- install / update --------------------------------------------------------------------------
+
+# Write FILE atomically (new inode): a running copy of this script keeps reading the old one.
+put() { mkdir -p "$(dirname "$2")"; cp -p "$1" "$2.kit-tmp" && mv "$2.kit-tmp" "$2"; }
+
+# Replace the marker block in FILE with BODYFILE, or append it.
+put_block() {
+  [ -f "$1" ] || : >"$1"
+  if grep -q "^$BEGIN_MARK" "$1"; then
+    awk -v bf="$2" -v b="$BEGIN_MARK" -v e="$END_MARK" '
+      index($0, b) == 1 { while ((getline l < bf) > 0) print l; skip = 1; next }
+      skip && index($0, e) == 1 { skip = 0; next }
+      !skip { print }' "$1" >"$1.kit-tmp" && mv "$1.kit-tmp" "$1"
+  else
+    { [ -s "$1" ] && printf '\n'; cat "$2"; } >>"$1"
+  fi
+}
+
+ignore() { [ -f .gitignore ] && grep -qxF "$1" .gitignore && return 0; printf '%s\n' "$1" >>.gitignore; }
+
+install_from() { # SRC MODE
+  src=$1 mode=$2 tmp=$(mktemp -d "${TMPDIR:-/tmp}/trizy.XXXXXX")
+  mkdir -p "$(journal_dir)" "$KIT/local/logs" "$KIT/local/receipts" "$KIT/local/reviews" "$KIT/local/tmp"
+  old="$KIT/manifest"
+  if [ -f "$old" ]; then cp "$old" "$tmp/old"; else : >"$tmp/old"; fi
+  (cd "$src/template" && find . -type f | sed 's|^\./||' | sort) >"$tmp/list"
+  : >"$tmp/new"
+  while IFS= read -r f; do
+    n=$(sha "$src/template/$f")
+    if [ -f "$f" ]; then
+      cur=$(sha "$f")
+      was=$(awk -v f="$f" '$2 == f { print $1 }' "$tmp/old")
+      if [ "$cur" != "$n" ] && [ "$cur" != "${was:-none}" ]; then
+        cp -p "$f" "$f.orig"
+        say "$f was edited here: your version is in $f.orig (put lasting changes in $KIT/CONSTRAINTS.md or flows.tsv)"
+      fi
+    fi
+    put "$src/template/$f" "$f"
+    printf '%s  %s\n' "$n" "$f" >>"$tmp/new"
+  done <"$tmp/list"
+  while read -r s f; do
+    awk -v f="$f" '$2 == f { found = 1 } END { exit !found }' "$tmp/new" && continue
+    [ -f "$f" ] || continue
+    if [ "$(sha "$f")" = "$s" ]; then rm -f "$f"; rmdir -p "$(dirname "$f")" 2>/dev/null || true; say "removed $f (dropped by the kit)"; else say "kept $f: dropped by the kit but edited here"; fi
+  done <"$tmp/old"
+  put "$tmp/new" "$old"
+  # Project-owned files: created once, never touched again.
+  (cd "$src/project" && find . -type f | sed 's|^\./||') | while IFS= read -r f; do
+    [ -e "$f" ] || { put "$src/project/$f" "$f"; say "created $f"; }
+  done
+  # Codex sees the skills through symlinks; a dropped skill leaves no dangling link.
+  mkdir -p .codex/skills
+  for d in "$src"/template/.claude/skills/*/; do
+    s=$(basename "$d")
+    [ -L ".codex/skills/$s" ] || [ ! -e ".codex/skills/$s" ] || continue
+    ln -sfn "../../.claude/skills/$s" ".codex/skills/$s"
+  done
+  for l in .codex/skills/*; do if [ -L "$l" ] && [ ! -e "$l" ]; then rm -f "$l"; fi; done
+  entry_points "$mode" "$tmp"
+  git_ignores "$mode" "$src"
+  hooks "${hooks_choice:-}"
+  rm -rf "$tmp"
+}
+
+entry_points() { # MODE TMP
+  cat >"$2/agents" <<EOF
+$BEGIN_MARK (managed by .trizy/bin/trizy; write project rules outside the markers) -->
+## trizy
+
+Every agent and every person working here follows trizy. Before any task read, in this order:
+\`.trizy/AGENTS.trizy.md\`, \`.trizy/CONSTRAINTS.md\`, \`.trizy/rules/*.md\`, \`.trizy/project.conf\`,
+\`.trizy/flows.tsv\`. Tools: \`trizy <command>\` (or \`.trizy/bin/trizy\` where trizy is not installed).
+$END_MARK
+EOF
+  { printf '%s (managed by .trizy/bin/trizy) -->\n' "$BEGIN_MARK"
+    printf '@.trizy/AGENTS.trizy.md\n@.trizy/CONSTRAINTS.md\n'
+    for r in "$KIT"/rules/*.md; do printf '@%s\n' "$r"; done
+    printf '%s\n' "$END_MARK"; } >"$2/claude"
+  if [ "$1" = track ]; then
+    put_block AGENTS.md "$2/agents"
+    put_block CLAUDE.md "$2/claude"
+  else
+    # Ignored mode never edits tracked files: Claude reads CLAUDE.local.md; AGENTS.md only if git does not track it.
+    put_block CLAUDE.local.md "$2/claude"
+    if git ls-files --error-unmatch AGENTS.md >/dev/null 2>&1; then
+      say "AGENTS.md is tracked: not edited in --ignore mode; Codex needs its block (trizy init --track, or add it by hand)"
+    else
+      put_block AGENTS.md "$2/agents"
+      ignore /AGENTS.md
+    fi
+  fi
+}
+
+git_ignores() { # MODE SRC
+  ignore "/$KIT/local/"
+  [ "$1" = ignore ] || return 0
+  ignore "/$KIT/"
+  ignore /CLAUDE.local.md
+  for d in "$2"/template/.claude/skills/*/; do ignore "/.claude/skills/$(basename "$d")/"; ignore "/.codex/skills/$(basename "$d")"; done
+  for w in "$2"/template/.claude/workflows/*; do ignore "/.claude/workflows/$(basename "$w")"; done
+  if [ -n "$(git ls-files "$KIT" 2>/dev/null)" ]; then say "$KIT is already tracked: git rm -r --cached $KIT to stop tracking it"; fi
+}
+
+# The project's own hooks directory under core.hooksPath. ponytail: husky 9 regenerates `.husky/_` and runs the
+# user's hooks from its parent, so the merge goes there.
+hooks_dir() { hd=${1%/}; case $hd in */_) hd=${hd%/_} ;; esac; printf '%s\n' "$hd"; }
+hooks_merged() { grep -qs "$KIT/hooks/pre-commit" "$(hooks_dir "$1")/pre-commit"; }
+
+hooks() { # replace | merge | '' (keep a foreign hooks path, say how to call ours)
+  hooks_path=$(git config --get core.hooksPath || true)
+  case $hooks_path in '' | "$KIT/hooks") git config core.hooksPath "$KIT/hooks"; return 0 ;; esac
+  case ${1:-} in
+    replace)
+      git config core.hooksPath "$KIT/hooks"
+      say "core.hooksPath $hooks_path -> $KIT/hooks: hooks in $(hooks_dir "$hooks_path") no longer run; move their commands into the commit and push steps of $KIT/flows.tsv" ;;
+    merge)
+      hdir=$(hooks_dir "$hooks_path")
+      for hk in pre-commit pre-push; do
+        grep -qs "$KIT/hooks/$hk" "$hdir/$hk" && continue
+        [ -f "$hdir/$hk" ] || { mkdir -p "$hdir" && printf '#!/bin/sh\n' >"$hdir/$hk" && chmod +x "$hdir/$hk"; }
+        # First, after the shebang: a trailing exit/exec cannot skip it, and pre-push reads the refs on stdin first.
+        # A checkout without the kit (a teammate in ignore mode, CI) skips it.
+        call=$(printf 'trizy_hook="$(git rev-parse --show-toplevel)/%s/hooks/%s"; if [ -x "$trizy_hook" ]; then "$trizy_hook" "$@" || exit $?; fi # trizy' "$KIT" "$hk")
+        { if head -n 1 "$hdir/$hk" | grep -q '^#!'; then head -n 1 "$hdir/$hk"; printf '%s\n' "$call"; tail -n +2 "$hdir/$hk"
+          else printf '%s\n' "$call"; cat "$hdir/$hk"; fi; } >"$hdir/$hk.kit-tmp"
+        cat "$hdir/$hk.kit-tmp" >"$hdir/$hk" && rm -f "$hdir/$hk.kit-tmp" # cat >, not mv: keeps the hook's mode
+      done
+      say "core.hooksPath stays $hooks_path: $hdir/pre-commit and $hdir/pre-push now call $KIT/hooks" ;;
+    *) hooks_merged "$hooks_path" || say "core.hooksPath is $hooks_path: call $KIT/hooks/pre-commit and $KIT/hooks/pre-push from your hooks (or trizy init --hooks=replace|merge)" ;;
+  esac
+}
+
+set_conf() { # KEY VALUE — in project.conf
+  if grep -q "^$1=" "$KIT/project.conf"; then
+    awk -v k="$1" -v v="$2" 'index($0, k "=") == 1 { print k "=" v; next } { print }' "$KIT/project.conf" >"$KIT/project.conf.kit-tmp" &&
+      mv "$KIT/project.conf.kit-tmp" "$KIT/project.conf"
+  else printf '%s=%s\n' "$1" "$2" >>"$KIT/project.conf"; fi
+}
+
+cmd_init() {
+  mode='' hooks_choice=''
+  for a in "$@"; do
+    case $a in
+      --track) mode=track ;; --ignore) mode=ignore ;;
+      --hooks=replace | --hooks=merge) hooks_choice=${a#--hooks=} ;;
+      *) die "init: unknown option $a" ;;
+    esac
+  done
+  src=$(self_src) || die "init runs from a trizy checkout: <kit>/bin/trizy init"
+  to_root
+  if [ -z "$mode" ]; then
+    [ -t 0 ] || die "init: no terminal to ask; pass --track or --ignore"
+    printf 'Put the agent files (.trizy, the kit skills and workflow) in git, or ignore them? [T]rack / [i]gnore: '
+    read -r ans || ans=''
+    case $ans in i* | I*) mode=ignore ;; *) mode=track ;; esac
+  fi
+  hp=$(git config --get core.hooksPath || true)
+  case $hp in '' | "$KIT/hooks") ;; *)
+    if [ -z "$hooks_choice" ] && [ -t 0 ] && ! hooks_merged "$hp"; then
+      printf 'core.hooksPath is %s. [R]eplace it with %s (recommended: the commit flow runs your tests and linters before every commit), or [m]erge (your hooks in %s call ours)? [R]eplace / [m]erge: ' "$hp" "$KIT/hooks" "$(hooks_dir "$hp")"
+      read -r ans || ans=''
+      case $ans in m* | M*) hooks_choice=merge ;; *) hooks_choice=replace ;; esac
+    fi
+    case $hooks_choice:$hp in merge:/* | merge:'~'*) die "init: $hp is outside the repository; merge by hand (call $KIT/hooks/pre-commit and pre-push from it) or --hooks=replace" ;; esac ;;
+  esac
+  refresh_main
+  install_from "$src" "$mode"
+  set_conf TRIZY_GIT "$mode"
+  origin=$(git -C "$src" remote get-url origin 2>/dev/null || true)
+  # Only a network URL: a path on this machine means nothing to a teammate (and is committed in track mode).
+  case $origin in *://* | *@*:*) case $origin in file://*) ;; *) set_conf TRIZY_SOURCE "$origin" ;; esac ;; esac
+  load_conf
+  say "installed trizy $(cat "$KIT/VERSION") ($mode), main branch $MAIN_BRANCH from git; next: fill $KIT/flows.tsv and $KIT/project.conf, then trizy check"
+}
+
+cmd_update() {
+  from='' ref=''
+  while [ $# -gt 0 ]; do
+    case $1 in --from) from=${2:?}; shift 2 ;; --ref) ref=${2:?}; shift 2 ;; *) die "update: unknown option $1" ;; esac
+  done
+  to_root
+  load_conf
+  # Default: the installed kit this command runs from (no network); a ref or no install means the git source.
+  src=$from
+  if [ -z "$src" ] && [ -z "$ref" ]; then src=$(self_src || true); fi
+  src=${src:-$TRIZY_SOURCE}
+  [ -n "$src" ] || die "update: no source; set TRIZY_SOURCE in $KIT/project.conf or pass --from"
+  src_tmp=$(mktemp -d "${TMPDIR:-/tmp}/trizy.XXXXXX") # not `tmp`: install_from uses that name (sh has no locals)
+  if [ -d "$src" ] && [ -z "$ref" ]; then cp -R "$src/." "$src_tmp/kit"
+  else
+    [ -d "$src" ] && src="file://$(cd "$src" && pwd)"
+    git clone -q --depth 1 --branch "${ref:-$TRIZY_REF}" "$src" "$src_tmp/kit" || die "update: cannot clone $src (${ref:-$TRIZY_REF})"
+  fi
+  [ -d "$src_tmp/kit/template/$KIT" ] || die "update: $src is not a trizy source"
+  before=$(cat "$KIT/VERSION" 2>/dev/null || echo none) # not `was`: install_from uses that name (sh has no locals)
+  refresh_main
+  install_from "$src_tmp/kit" "$TRIZY_GIT"
+  rm -rf "$src_tmp"
+  say "updated $before -> $(cat "$KIT/VERSION"); review the diff, then commit it"
+}
+
+cmd_check() {
+  to_root
+  load_conf
+  say "main branch $MAIN_BRANCH"
+  bad=0
+  # 0.2.0 wrote MAIN_BRANCH and a local TRIZY_SOURCE into project.conf, which update never touches: say so.
+  if grep -q '^MAIN_BRANCH=' "$KIT/project.conf" 2>/dev/null && [ "$MAIN_BRANCH" != "$(main_branch)" ]; then
+    say "MAIN_BRANCH=$MAIN_BRANCH in $KIT/project.conf overrides git's $(main_branch): delete the line to follow git"
+  fi
+  case $TRIZY_SOURCE in
+    /* | file://* | ./* | ../*) say "TRIZY_SOURCE is a local path ($TRIZY_SOURCE): set the kit's git URL in $KIT/project.conf" ;;
+  esac
+  [ -f "$KIT/manifest" ] || die "not installed here: run <kit>/bin/trizy init"
+  while read -r s f; do
+    if [ ! -f "$f" ]; then say "missing $f"; bad=1
+    elif [ "$(sha "$f")" != "$s" ]; then say "edited $f (trizy update moves your version to $f.orig)"; fi
+  done <"$KIT/manifest"
+  for f in project.conf CONSTRAINTS.md flows.tsv review-rules.tsv; do [ -f "$KIT/$f" ] || { say "missing $KIT/$f"; bad=1; }; done
+  for d in local/logs local/receipts local/reviews; do [ -d "$KIT/$d" ] || { say "missing $KIT/$d/"; bad=1; }; done
+  git check-ignore -q "$KIT/local/x" || { say "$KIT/local/ is not ignored"; bad=1; }
+  hooks_path=$(git config --get core.hooksPath || true)
+  [ "$hooks_path" = "$KIT/hooks" ] || hooks_merged "$hooks_path" || say "core.hooksPath is ${hooks_path:-unset} and its hooks do not call $KIT/hooks: trizy init --hooks=replace|merge"
+  grep -qs "^$BEGIN_MARK" AGENTS.md CLAUDE.md CLAUDE.local.md || { say "no trizy block in AGENTS.md / CLAUDE.md"; bad=1; }
+  [ "$bad" = 0 ] && say "ok: trizy $(cat "$KIT/VERSION") ($TRIZY_GIT)"
+  return "$bad"
+}
+
+# ---- run journal --------------------------------------------------------------------------------
+
+json_str() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e "s/$TAB/\\\\t/g" | awk 'NR > 1 { printf "\\n" } { printf "%s", $0 }'; }
+
+cmd_log() {
+  to_root
+  task='' result=''
+  for kv in "$@"; do case $kv in task=*) task=${kv#task=} ;; result=*) result=${kv#result=} ;; esac; done
+  [ -n "$task" ] || die 'log: task="..." is required'
+  case $result in pass | fail | partial) ;; *) die "log: result=pass|fail|partial is required" ;; esac
+  line="{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"t\":$(date -u +%s)"
+  line="$line,\"actor\":\"$(json_str "${TRIZY_ACTOR:-$(git config user.name || echo unknown)}")\""
+  line="$line,\"branch\":\"$(git branch --show-current 2>/dev/null || true)\",\"head\":\"$(git rev-parse --short HEAD 2>/dev/null || true)\""
+  for kv in "$@"; do
+    k=${kv%%=*}
+    case $k in '' | *[!a-z_]*) die "log: bad field '$k' (lowercase letters and _ only)" ;; esac
+    line="$line,\"$k\":\"$(json_str "${kv#*=}")\""
+  done
+  j=$(journal_dir)
+  mkdir -p "$j"
+  f="$j/$(date -u +%Y-%m).jsonl"
+  printf '%s}\n' "$line" >>"$f"
+  say "logged to $f"
+}
+
+# ---- flows and steps ----------------------------------------------------------------------------
+
+FLOWS="$KIT/flows.tsv"
+flow_known() { case " $BUILTIN_FLOWS " in *" $1 "*) return 0 ;; esac; awk -F'\t' -v f="$1" '$1 == f { found = 1 } END { exit !found }' "$FLOWS"; }
+name_ok() { case $1 in '' | *[!a-z0-9:_-]*) die "bad name '$1' (a-z 0-9 : _ -)" ;; esac; }
+
+cmd_flow() {
+  to_root
+  [ -f "$FLOWS" ] || die "no $FLOWS: run trizy init"
+  sub=${1:-list}
+  [ $# -gt 0 ] && shift
+  case $sub in
+    list)
+      for f in $BUILTIN_FLOWS; do printf '%-16s built-in  %s step(s)\n' "$f" "$(awk -F'\t' -v f="$f" '$1 == f && $3 != "flow"' "$FLOWS" | wc -l | tr -d ' ')"; done
+      awk -F'\t' '$3 == "flow" { printf "%-16s custom    %s\n", $1, $4 }' "$FLOWS" ;;
+    show)
+      f=${1:?flow}; flow_known "$f" || die "no flow $f"
+      awk -F'\t' -v f="$f" '$1 == f && $3 != "flow" { printf "%d. %s [%s] %s\n", ++n, $2, $3, $4 } END { if (!n) print "(no steps)" }' "$FLOWS" ;;
+    add)
+      f=${1:?flow}; name_ok "$f"; shift
+      flow_known "$f" && die "flow $f exists"
+      printf '%s\t-\tflow\t%s\n' "$f" "${*:-custom flow}" >>"$FLOWS"
+      say "flow $f added; add steps: trizy step add $f <name> run|ask \"...\"" ;;
+    rm)
+      f=${1:?flow}
+      case " $BUILTIN_FLOWS " in *" $f "*) die "$f is built in: remove its steps instead" ;; esac
+      awk -F'\t' -v f="$f" '$1 != f' "$FLOWS" >"$FLOWS.kit-tmp" && mv "$FLOWS.kit-tmp" "$FLOWS"
+      say "flow $f removed" ;;
+    run) f=${1:?flow}; flow_known "$f" || die "no flow $f"; run_flow "$f" ;;
+    *) die "flow: list|show|add|rm|run" ;;
+  esac
+}
+
+cmd_step() {
+  to_root
+  sub=${1:?step add|rm}
+  shift
+  case $sub in
+    add)
+      [ $# -ge 4 ] || die 'step add FLOW NAME run|ask "BODY"'
+      f=$1 n=$2 k=$3
+      shift 3
+      flow_known "$f" || die "no flow $f: trizy flow add $f"
+      name_ok "$n"
+      case $k in run | ask) ;; *) die "step kind is run or ask" ;; esac
+      awk -F'\t' -v f="$f" -v n="$n" '$1 == f && $2 == n { found = 1 } END { exit !found }' "$FLOWS" && die "step $f/$n exists"
+      case "$*" in *"$TAB"*) die "a step body cannot contain a tab" ;; esac
+      printf '%s\t%s\t%s\t%s\n' "$f" "$n" "$k" "$*" >>"$FLOWS"
+      say "step $f/$n added" ;;
+    rm)
+      f=${1:?flow} n=${2:?name}
+      awk -F'\t' -v f="$f" -v n="$n" '!($1 == f && $2 == n)' "$FLOWS" >"$FLOWS.kit-tmp" && mv "$FLOWS.kit-tmp" "$FLOWS"
+      say "step $f/$n removed" ;;
+    *) die "step: add|rm" ;;
+  esac
+}
+
+# Run the `run` steps of a flow in order, fail fast; each log goes to a file, the screen gets the verdict
+# and, on failure, the error lines. `ask` steps are printed for the agent or person running the flow.
+run_flow() {
+  dir="$KIT/local/logs/$(stamp)-$(printf '%s' "$1" | tr ':' '-')"
+  mkdir -p "$dir"
+  awk -F'\t' -v f="$1" '$1 == f && $3 != "flow" { print $2 "\t" $3 "\t" $4 }' "$FLOWS" >"$dir/steps"
+  while IFS="$TAB" read -r n k body; do
+    if [ "$k" = ask ]; then say "$1/$n (ask): $body"; continue; fi
+    log="$dir/$n.log"
+    if (cmd_heavy -- sh -c "$body") >"$log" 2>&1; then
+      say "$1/$n ok"
+    else
+      say "$1/$n FAILED, log $log"
+      if grep -qiE "error|fail|✘|×|panic|exception" "$log"; then grep -iE "error|fail|✘|×|panic|exception" "$log" | tail -20; else tail -20 "$log"; fi
+      return 1
+    fi
+  done <"$dir/steps"
+}
+
+# ---- gates (git hooks) --------------------------------------------------------------------------
+
+cmd_gate() {
+  to_root
+  load_conf
+  case ${1:?gate commit|push} in
+    commit)
+      run_flow commit
+      [ "$REVIEW_REQUIRED" = 1 ] || return 0
+      # shellcheck disable=SC2254
+      case $(git branch --show-current) in $REVIEW_EXEMPT_BRANCHES) return 0 ;; esac
+      review_verify "$(git write-tree)" ;;
+    push)
+      remote=${2:-}
+      if [ -n "$remote" ] && git cat-file -e "$remote^{commit}" 2>/dev/null; then range="$remote..HEAD"
+      elif git rev-parse -q --verify "refs/remotes/origin/$MAIN_BRANCH" >/dev/null; then range="origin/$MAIN_BRANCH..HEAD"
+      else range=HEAD; fi
+      if [ -n "$(git rev-list "$range" 2>/dev/null | head -1)" ]; then journal_covers "$range"; fi
+      receipt="$KIT/local/receipts/push-$(git rev-parse 'HEAD^{tree}')"
+      if [ -f "$receipt" ]; then say "push flow already passed for this tree ($(cat "$receipt"))"; return 0; fi
+      run_flow push
+      date -u '+%Y-%m-%dT%H:%M:%SZ' >"$receipt" ;;
+    *) die "gate: commit|push" ;;
+  esac
+}
+
+# Every push carries a run journal entry of its own branch written after its oldest commit (the journal is local and
+# shared by every worktree, so another branch's entry must not count; a detached HEAD takes any entry).
+journal_covers() {
+  oldest=$(git log --format=%ct "$1" | tail -1)
+  b=$(git branch --show-current)
+  last=$(cat "$(journal_dir)"/*.jsonl 2>/dev/null | grep -F "${b:+\"branch\":\"$b\"}" | tail -1 | sed -n 's/.*"t":\([0-9]*\).*/\1/p')
+  [ -n "$last" ] && [ "$last" -ge "$oldest" ] && return 0
+  die "no run journal entry${b:+ on $b} for these commits: trizy log task=\"...\" result=pass|fail|partial"
+}
+
+# ---- review receipts ----------------------------------------------------------------------------
+
+EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
+
+cmd_review() {
+  to_root
+  load_conf
+  case ${1:?review prepare|verify} in
+    prepare) review_prepare ;;
+    verify) review_verify "${2:-$(git write-tree)}" && say "review ok" ;;
+    *) die "review: prepare|verify" ;;
+  esac
+}
+
+# The ids of the review rules whose glob matches PATH (kept out of $(...): bash 3.2 misparses a case there).
+rule_ids() {
+  awk -F'\t' '!/^#/ && NF >= 3 { print $1 "\t" $2 }' "$KIT/review-rules.tsv" | while IFS="$TAB" read -r id g; do
+    # shellcheck disable=SC2254
+    case $1 in $g) printf '%s ' "$id" ;; esac
+  done
+}
+
+review_prepare() {
+  tree=$(git write-tree)
+  f="$KIT/local/reviews/$tree.md"
+  [ -f "$f" ] && { say "exists: $f"; return 0; }
+  base=$(git rev-parse -q --verify HEAD || echo "$EMPTY_TREE")
+  git diff --cached --name-status "$base" >"$f.files"
+  [ -s "$f.files" ] || { rm -f "$f.files"; die "review: nothing staged"; }
+  {
+    printf '# Review of tree %s\n\nauthor: %s\nreviewer: \ndecision: pending\n\n' "$tree" "${TRIZY_ACTOR:-$(git config user.name || echo unknown)}"
+    printf '## Rules\n\n'
+    awk -F'\t' '!/^#/ && NF >= 3 { printf "- %s (%s): %s\n", $1, $2, $3 }' "$KIT/review-rules.tsv"
+    printf '\n## Files (tick each one you reviewed)\n\n'
+    while IFS="$TAB" read -r st p rest; do
+      [ -n "$rest" ] && p=$rest # renames: the new path
+      ids=$(rule_ids "$p")
+      printf "%s\n" "- [ ] $st $p: ${ids:-no rule}"
+    done <"$f.files"
+    printf '\n## Findings\n\n<!-- one per line: - blocker|major|minor | path:line | issue | open|fixed -->\n'
+  } >"$f"
+  rm -f "$f.files"
+  say "receipt: $f (an independent reviewer fills reviewer, decision, ticks and findings)"
+}
+
+review_verify() {
+  f="$KIT/local/reviews/$1.md"
+  [ -f "$f" ] || die "no review for the staged tree $1: trizy review prepare, then an independent reviewer fills $f"
+  author=$(sed -n 's/^author: *//p' "$f")
+  reviewer=$(sed -n 's/^reviewer: *//p' "$f")
+  [ -n "$reviewer" ] || die "review $f: reviewer is empty"
+  [ "$reviewer" != "$author" ] || die "review $f: the reviewer is the author"
+  grep -q '^decision: *approve *$' "$f" || die "review $f: decision is not approve"
+  ! grep -q '^- \[ \]' "$f" || die "review $f: unticked files"
+  ! grep -qiE '^- *(blocker|major) *\|.*\| *open *$' "$f" || die "review $f: an open blocker/major finding"
+}
+
+# ---- worktrees ----------------------------------------------------------------------------------
+
+wt_root() {
+  r=${WORKTREE_ROOT:-../$(basename "$PWD")-worktrees}
+  case $r in /*) ;; *) r="$PWD/$r" ;; esac
+  mkdir -p "$r" && (cd "$r" && pwd)
+}
+wt_path() { git worktree list --porcelain | awk -v b="refs/heads/$1" '/^worktree / { p = substr($0, 10) } $0 == "branch " b { print p }'; }
+
+cmd_worktree() {
+  to_root
+  load_conf
+  sub=${1:-list}
+  [ $# -gt 0 ] && shift
+  case $sub in
+    new)
+      br=${1:?branch} base=${2:-$MAIN_BRANCH}
+      existing=$(wt_path "$br")
+      # Reuse a trizy worktree (callers retry); a branch checked out anywhere else, e.g. the main checkout, is refused.
+      case $existing in "$(wt_root)"/*) printf '%s\n' "$existing"; return 0 ;; ?*) die "$br is checked out at $existing, outside the kit's worktrees" ;; esac
+      path="$(wt_root)/$(printf '%s' "$br" | tr '/' '-')"
+      git fetch -q origin "$base" 2>/dev/null || true
+      if git rev-parse -q --verify "refs/remotes/origin/$base" >/dev/null; then start="origin/$base"; else start=$base; fi
+      if git rev-parse -q --verify "refs/heads/$br" >/dev/null; then git worktree add -q "$path" "$br"
+      else git worktree add -q -b "$br" "$path" "$start"; fi
+      printf '%s\n' "$path" ;;
+    rm)
+      br=${1:?branch}
+      path=$(wt_path "$br")
+      [ -n "$path" ] || die "no worktree for $br"
+      if [ "${2:-}" = --force ]; then git worktree remove --force "$path"
+      else
+        [ -z "$(git -C "$path" status --porcelain)" ] || die "$path has uncommitted changes (--force discards them)"
+        git worktree remove "$path"
+      fi
+      git worktree prune
+      say "removed $path (branch $br kept)" ;;
+    sweep)
+      root=$(wt_root)
+      git fetch -q origin "$MAIN_BRANCH" 2>/dev/null || true
+      target=$MAIN_BRANCH
+      git rev-parse -q --verify "refs/remotes/origin/$MAIN_BRANCH" >/dev/null && target="origin/$MAIN_BRANCH"
+      git worktree list --porcelain | awk '/^worktree / { p = substr($0, 10) } /^branch / { print p "\t" substr($0, 19) }' |
+        while IFS="$TAB" read -r p b; do
+          case $p in "$root"/*) ;; *) continue ;; esac
+          if [ -z "$(git -C "$p" status --porcelain)" ] && git merge-base --is-ancestor "$b" "$target"; then
+            git worktree remove "$p" && say "removed $p ($b is merged)"
+          else say "kept $p ($b: unmerged or dirty)"; fi
+        done ;;
+    list) git worktree list ;;
+    *) die "worktree: new|rm|sweep|list" ;;
+  esac
+}
+
+# ---- heavy queue --------------------------------------------------------------------------------
+
+# A machine-wide slot queue (mkdir is atomic). Nested calls run at once: the outer call holds the slot.
+cmd_heavy() {
+  [ "${1:-}" = -- ] && shift
+  [ $# -gt 0 ] || die "heavy -- CMD..."
+  [ -n "${TRIZY_HEAVY_HELD:-}" ] && { "$@"; return; }
+  slots=1
+  if R=$(git rev-parse --show-toplevel 2>/dev/null) && [ -f "$R/$KIT/project.conf" ]; then
+    slots=$(sed -n 's/^HEAVY_SLOTS=\([0-9]*\).*/\1/p' "$R/$KIT/project.conf" | tail -1)
+    slots=${slots:-1}
+  fi
+  q=${TRIZY_HEAVY_DIR:-${TMPDIR:-/tmp}/trizy-heavy}
+  mkdir -p "$q"
+  told=''
+  while :; do
+    i=1
+    while [ "$i" -le "$slots" ]; do
+      s="$q/slot-$i"
+      if mkdir "$s" 2>/dev/null; then
+        printf '%s %s\n' "$$" "$*" >"$s/owner"
+        trap 'rm -rf "$s"' EXIT INT TERM HUP
+        TRIZY_HEAVY_HELD=1
+        export TRIZY_HEAVY_HELD
+        set +e
+        "$@"
+        rc=$?
+        set -e
+        rm -rf "$s"
+        trap - EXIT INT TERM HUP
+        unset TRIZY_HEAVY_HELD
+        return "$rc"
+      fi
+      pid=$(cut -d' ' -f1 "$s/owner" 2>/dev/null || true)
+      if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then rm -rf "$s"; continue; fi # a dead holder
+      i=$((i + 1))
+    done
+    [ -n "$told" ] || { say "waiting for a heavy slot (held by: $(cat "$q"/slot-*/owner 2>/dev/null | head -1))" >&2; told=1; }
+    sleep 2
+  done
+}
+
+# ---- versions -----------------------------------------------------------------------------------
+
+cmd_version() {
+  if s=$(self_src); then printf 'installed: %s (%s)\n' "$(cat "$s/template/$KIT/VERSION")" "$s"; fi
+  if R=$(git rev-parse --show-toplevel 2>/dev/null) && [ -f "$R/$KIT/VERSION" ]; then printf 'project:   %s (%s)\n' "$(cat "$R/$KIT/VERSION")" "$R"; fi
+  return 0
+}
+
+# Move the user install to the newest commit of a branch or to a tag of its origin (main by default).
+cmd_upgrade() {
+  ver=${TRIZY_VERSION:-}
+  while [ $# -gt 0 ]; do case $1 in --version) ver=${2:?}; shift 2 ;; *) die "upgrade: unknown option $1" ;; esac; done
+  s=$(self_src) || die "upgrade runs from the installed trizy (install.sh)"
+  was=$(cat "$s/template/$KIT/VERSION")
+  # A copy: install.sh replaces the directory it lives in.
+  up=$(mktemp "${TMPDIR:-/tmp}/trizy-install.XXXXXX")
+  cp "$s/install.sh" "$up"
+  # TRIZY_BIN empty: the wrapper on PATH already points at $s, which stays where it is.
+  TRIZY_HOME=$s TRIZY_BIN='' TRIZY_VERSION=$ver sh "$up" >/dev/null || { rm -f "$up"; die "upgrade: install.sh failed"; }
+  rm -f "$up"
+  say "installed $was -> $(cat "$s/template/$KIT/VERSION")${ver:+ ($ver)}; bring a repository to it with: trizy update"
+}
+
+# ---- main ---------------------------------------------------------------------------------------
+
+usage() { sed -n '4,16p' "$0" | sed 's/^# \{0,1\}//'; }
+
+cmd=${1:-help}
+[ $# -gt 0 ] && shift
+case $cmd in
+  init) cmd_init "$@" ;;
+  update) cmd_update "$@" ;;
+  check) cmd_check ;;
+  version) cmd_version ;;
+  upgrade) cmd_upgrade "$@" ;;
+  log) cmd_log "$@" ;;
+  flow) cmd_flow "$@" ;;
+  step) cmd_step "$@" ;;
+  gate) cmd_gate "$@" ;;
+  review) cmd_review "$@" ;;
+  worktree) cmd_worktree "$@" ;;
+  heavy) cmd_heavy "$@" ;;
+  help | -h | --help) usage ;;
+  *) usage; exit 2 ;;
+esac

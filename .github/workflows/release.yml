@@ -1,0 +1,31 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: the tag matches VERSION
+        run: test "v$(cat template/.trizy/VERSION)" = "$GITHUB_REF_NAME"
+      - name: tests
+        run: sh tests/run.sh
+      - name: package
+        run: sh scripts/package.sh dist
+      # release text: docs/releases/<tag>.md (if present) plus the shared install block
+      - name: release notes
+        run: |
+          notes="docs/releases/${GITHUB_REF_NAME}.md"
+          if [ -f "$notes" ]; then cat "$notes" > body.md; fi
+          sed "s/{{TAG}}/${GITHUB_REF_NAME}/g" .github/release-footer.md >> body.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: trizy ${{ github.ref_name }}
+          body_path: body.md
+          files: |
+            dist/trizy.tar.gz
+            dist/trizy.tar.gz.sha256

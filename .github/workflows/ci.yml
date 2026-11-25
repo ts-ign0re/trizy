@@ -1,0 +1,22 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: syntax (sh -n)
+        run: for f in template/.trizy/bin/trizy template/.trizy/hooks/* bin/trizy install.sh scripts/package.sh tests/run.sh; do sh -n "$f"; done
+      - name: tests
+        run: sh tests/run.sh
+      - name: tests under dash (strict POSIX)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y dash >/dev/null && TRIZY_SH=dash sh tests/run.sh

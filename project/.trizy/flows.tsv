@@ -1,0 +1,7 @@
+# flow	step	kind	body — owned by this project. Kinds: run (a shell command, run from the repo root by
+# `trizy flow run`, fail fast, logs in .trizy/local/logs) and ask (an instruction for whoever runs the flow).
+# Built-in flows: commit (pre-commit), push (pre-push), deliver:plan|build|gate|verify (the deliver pipeline).
+# Manage with: trizy flow add|rm, trizy step add|rm. Examples (uncomment, use your commands):
+# commit	lint	run	make lint
+# push	test	run	make test
+# deliver:gate	api	ask	The public API changes only additively.

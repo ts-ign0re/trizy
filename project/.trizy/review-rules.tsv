@@ -1,0 +1,2 @@
+# id	glob	rule — owned by this project; `trizy review prepare` lists the rules that match each staged file.
+all	*	Correct on boundary, empty and malformed input; errors handled, resources released; no secrets or personal data in code or logs; tests prove the behaviour; docs agree with the code; no unrequested abstraction (ponytail); the optimality line or block is present.

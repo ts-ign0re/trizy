@@ -1,0 +1,17 @@
+/AGENTS.md
+/.trizy/local/
+/.trizy/
+/CLAUDE.local.md
+/.claude/skills/optimality-check/
+/.codex/skills/optimality-check
+/.claude/skills/ponytail-review/
+/.codex/skills/ponytail-review
+/.claude/skills/ponytail/
+/.codex/skills/ponytail
+/.claude/skills/retro/
+/.codex/skills/retro
+/.claude/skills/review-gate/
+/.codex/skills/review-gate
+/.claude/skills/security-reviewer/
+/.codex/skills/security-reviewer
+/.claude/workflows/deliver.js

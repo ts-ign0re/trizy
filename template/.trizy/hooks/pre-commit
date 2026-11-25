@@ -1,0 +1,3 @@
+#!/bin/sh
+# trizy: the `commit` flow's run steps, then the review receipt of the staged tree (REVIEW_REQUIRED=1).
+exec "$(git rev-parse --show-toplevel)/.trizy/bin/trizy" gate commit

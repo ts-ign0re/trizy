@@ -1,0 +1,24 @@
+#!/bin/sh
+# trizy: the pushed commit must be this clean checkout's HEAD (the flow tests the working tree); the run
+# journal must cover the pushed commits; then the `push` flow, once per tree (a receipt skips a passed tree).
+set -e
+zero=0000000000000000000000000000000000000000
+head=$(git rev-parse HEAD)
+remote=''
+prove=''
+while read -r _local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "$zero" ] && continue
+  case $remote_ref in refs/tags/*) continue ;; esac
+  if [ "$local_sha" != "$head" ]; then
+    echo "trizy: $local_sha is not this checkout's HEAD: push from the checkout of that branch"
+    exit 1
+  fi
+  [ "$remote_sha" = "$zero" ] || remote=$remote_sha
+  prove=1
+done
+[ -n "$prove" ] || exit 0
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+  echo "trizy: uncommitted changes here: the push flow would test them, not the pushed commit"
+  exit 1
+fi
+exec "$(git rev-parse --show-toplevel)/.trizy/bin/trizy" gate push "$remote"

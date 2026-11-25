@@ -1,0 +1,13 @@
+#!/bin/sh
+# The `trizy` command. install.sh puts a wrapper on PATH that runs this file of the user install.
+# Inside a repository that has the kit, every project command runs that repository's own pinned copy
+# (.trizy/bin/trizy); init, update and upgrade run the installed kit, the source of new versions.
+here=$(cd "$(dirname "$0")/.." && pwd)
+kit="$here/template/.trizy/bin/trizy"
+case ${1:-help} in
+  init | update | upgrade | version | help | -h | --help) exec "$kit" "$@" ;;
+esac
+if root=$(git rev-parse --show-toplevel 2>/dev/null) && [ -x "$root/.trizy/bin/trizy" ]; then
+  exec "$root/.trizy/bin/trizy" "$@"
+fi
+exec "$kit" "$@"
